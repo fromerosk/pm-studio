@@ -16,6 +16,12 @@ ARCHIVE_PATH = CONFIG.archive_rel
 #   costing.json   - pay rates
 #   audit.jsonl    - who did what, by name and email
 #   activity.jsonl - per-person activity signals
+#   trackers.json  - ticket titles pulled from the deployment's Jira/ADO
+#
+# trackers.json holds no credential of ours, but it is a cache of ANOTHER system's private
+# data - issue titles and states from someone's Jira. It earns its place here on cost:
+# never committing it costs exactly one re-sync, while committing it puts a third party's
+# ticket titles in this repo's history permanently.
 #
 # A snapshot is repo-wide (`git add -A`), so before this list existed the only thing
 # standing between a password hash and a pushed commit was the operator happening to have
@@ -29,6 +35,11 @@ SENSITIVE_WORKSPACE_FILES = (
     "costing.json",
     "audit.jsonl",
     "activity.jsonl",
+    "trackers.json",
+    # The people directory: real names and email addresses, reconciled out of the
+    # assignees on another organisation's tickets. Same category as trackers.json and a
+    # sharper case of it - a ticket title is their work, this is their identity.
+    "people.json",
 )
 
 

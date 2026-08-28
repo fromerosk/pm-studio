@@ -4,6 +4,8 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>PM Studio — Portfolio</title>
+<link rel="stylesheet" href="/static/nav.css" />
+<script src="/static/nav.js"></script>
 <style>
   :root {
     color-scheme: light dark;
@@ -20,6 +22,10 @@
     --warn-bg: rgba(199, 119, 0, 0.09);
     --note-bg: rgba(42, 120, 214, 0.07);
     --closed: #898781;
+    /* Same violet the board uses for the state (see roadmap.html): a portfolio
+       phase, deliberately not one of the delivery colors. */
+    --ideation: #7a4fc0;
+    --ideation-bg: rgba(122, 79, 192, 0.10);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -34,6 +40,8 @@
       --warn: #e0a33c;
       --warn-bg: rgba(224, 163, 60, 0.13);
       --note-bg: rgba(57, 135, 229, 0.12);
+      --ideation: #b087e8;
+      --ideation-bg: rgba(176, 135, 232, 0.14);
     }
   }
   * { box-sizing: border-box; }
@@ -127,7 +135,69 @@
     color: var(--warn);
     background: var(--warn-bg);
   }
+  /* The flag is a <span> everywhere except where it is the push control, and a <button>
+     brings its own border, font and background - so those are reset back to the pill the
+     rest of the row expects, leaving only the affordance. */
+  .flag.clickable {
+    font: inherit;
+    font-size: 0.72em;
+    font-weight: 600;
+    border: 1px solid transparent;
+    cursor: pointer;
+    line-height: inherit;
+  }
+  .flag.clickable:hover,
+  .flag.clickable:focus-visible { border-color: currentColor; text-decoration: underline; }
+  .flag.clickable:disabled { opacity: 0.6; cursor: default; text-decoration: none; }
   .flag.catch-all { color: var(--accent); background: var(--note-bg); }
+  .flag.ideation { color: var(--ideation); background: var(--ideation-bg); }
+  .meta .activity { color: var(--ideation); font-weight: 600; }
+  /* The epic a project is tracked as — the same badge language roadmap.html uses for
+     linked tickets, trimmed to the two states this page can show: an epic, or a link
+     whose ticket the last sync did not resolve. */
+  .ticket-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 1px 7px;
+    font-size: 0.72em;
+    font-weight: 600;
+    border: 1px solid var(--ticket-color, var(--border));
+    border-left: 3px solid var(--ticket-color, var(--border));
+    border-radius: 5px;
+    background: var(--ticket-bg, transparent);
+    color: var(--ticket-color, var(--ink-secondary));
+    text-decoration: none;
+    vertical-align: baseline;
+  }
+  a.ticket-badge:hover { text-decoration: underline; }
+  .ticket-badge .ticket-state { font-weight: 400; opacity: 0.8; }
+  .ticket-badge[data-type="epic"] { --ticket-color: #8b5cf6; --ticket-bg: rgba(139, 92, 246, 0.10); }
+  .ticket-badge.unresolved { border-style: dashed; --ticket-color: var(--ink-muted); --ticket-bg: transparent; }
+  @media (prefers-color-scheme: dark) {
+    .ticket-badge[data-type="epic"] { --ticket-color: #a78bfa; --ticket-bg: rgba(167, 139, 250, 0.16); }
+  }
+  .info-toggle {
+    padding: 0 2px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--ink-muted);
+    font-size: 0.85em;
+    line-height: 1;
+    vertical-align: baseline;
+  }
+  .info-toggle:hover, .info-toggle.open { color: var(--accent); }
+  .desc {
+    margin-top: 6px;
+    padding: 8px 10px;
+    font-size: 0.82em;
+    line-height: 1.5;
+    color: var(--ink-secondary);
+    background: var(--note-bg);
+    border-radius: 7px;
+    white-space: pre-wrap;
+  }
   .empty { font-size: 0.85em; color: var(--ink-muted); }
   .banner {
     margin-bottom: 18px;
@@ -165,13 +235,10 @@
 </style>
 </head>
 <body>
+<div id="pm-nav" data-page="portfolio"></div>
 <header>
-  <h1>PM Studio — Portfolio</h1>
+  <h1>Portfolio</h1>
   <p>Goals, initiatives and projects. Changes on the roadmap board hang off a project.</p>
-  <nav>
-    <a href="/">← Sessions</a>
-    <a href="/roadmap">Roadmap board</a>
-  </nav>
 </header>
 <main>
   <div class="chain">
@@ -182,6 +249,7 @@
   <p class="error" id="error"></p>
   <div id="bootstrap"></div>
   <div id="unaligned"></div>
+  <div id="session-scope"></div>
 
   <div class="columns">
     <section>
@@ -210,6 +278,9 @@
       <form id="project-form">
         <input id="project-title" type="text" placeholder="New project" required />
         <select id="project-initiative"></select>
+        <label class="hint" style="display: inline-flex; align-items: center; gap: 4px; white-space: nowrap;" title="An idea being worked — real and visible, expected to have no changes yet. Set it to open when you commit to building.">
+          <input id="project-ideation" type="checkbox" /> ideation
+        </label>
         <button type="submit">Add</button>
       </form>
       <ul id="projects"></ul>
@@ -217,7 +288,11 @@
   </div>
 </main>
 <script>
-  let data = { goals: [], initiatives: [], projects: [], unaligned: { projects: [], initiatives: [] } };
+  let data = {
+    goals: [], initiatives: [], projects: [],
+    unaligned: { projects: [], initiatives: [] },
+    session_scope: [],
+  };
   const errorBox = document.getElementById("error");
 
   function showError(message) {
@@ -258,6 +333,106 @@
     button.addEventListener("click", () => act(() =>
       api(`/portfolio/${entity}/${record.id}`, json("PATCH", { status: closing ? "closed" : "open" }))));
     return button;
+  }
+
+  // Projects carry a third state (ideation), so their lifecycle control is a select
+  // rather than the two-state Close/Reopen toggle goals and initiatives keep.
+  // Catch-alls never offer ideation: they are attribution plumbing, not ideas, and
+  // the server refuses it anyway.
+  function projectStatusPicker(project) {
+    const picker = document.createElement("select");
+    const statuses = project.catch_all_for_initiative
+      ? ["open", "closed"]
+      : ["ideation", "open", "closed"];
+    for (const value of statuses) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value;
+      if (value === project.status) option.selected = true;
+      picker.appendChild(option);
+    }
+    picker.addEventListener("change", () => act(() =>
+      api(`/portfolio/projects/${project.id}`, json("PATCH", { status: picker.value }))));
+    return picker;
+  }
+
+  /* ---- push: creating the epic a project doesn't have yet ----
+
+     The write half of the tracker link, and what closes the "not in tracker" state this
+     page has always only been able to report. Gated on `push_trackers` from
+     /portfolio/data, which the server fills only for a tracker that declares a
+     [trackers.push] target and has a working credential - so on a read-only deployment
+     none of this renders rather than rendering disabled. */
+
+  function pushTrackers(payload) {
+    return (payload && payload.push_trackers) || [];
+  }
+
+  /* "a Story" but "an Epic". The type is operator-configured free text, so the article
+     has to be chosen rather than written into the sentence. */
+  const article = (word) => (/^[aeiou]/i.test(word || "") ? "an" : "a");
+
+  function pushEpicButton(project, targets) {
+    const button = document.createElement("button");
+    button.className = "ghost";
+    button.textContent = "Push epic";
+    // More than one pushable tracker means the target is a choice, not a default, and
+    // the server refuses to guess it - so say so before the click rather than in an error.
+    const single = targets.length === 1 ? targets[0] : null;
+    button.title = single
+      ? `Create "${project.title}" in ${single.label} as ${article(single.push.epic_type)} ` +
+        `${single.push.epic_type} in ${single.push.project}, and link it as this project's epic`
+      : "Create this project's epic — you'll choose which tracker";
+    button.addEventListener("click", () => pushEpic(button, project, targets));
+    return button;
+  }
+
+  /* The push itself, shared by the button and the "not in tracker" flag so the two can
+     never drift into meaning different things. `control` is disabled for the duration: a
+     push is not idempotent, and a double-click that filed two epics for one project
+     would be this feature's worst failure. */
+  function pushEpic(control, project, targets) {
+    const single = targets.length === 1 ? targets[0] : null;
+    return (async () => {
+      let target = single;
+      if (!target) {
+        const wanted = prompt(
+          "Which tracker should the epic be created in?\n" +
+            targets.map((t) => `${t.id} — ${t.label} (${t.push.project})`).join("\n"),
+          targets[0].id
+        );
+        if (wanted === null) return;
+        target = targets.find((t) => t.id === wanted.trim());
+        if (!target) { showError(`No pushable tracker with id "${wanted.trim()}".`); return; }
+      }
+      if (!confirm(
+        `Create ${article(target.push.epic_type)} ${target.push.epic_type} in ` +
+        `${target.label} (${target.push.project}) for:\n\n` +
+        `${project.title}\n\n` +
+        "This creates a real epic on that board and links it to this project."
+      )) return;
+      const original = control.textContent;
+      control.disabled = true;
+      control.textContent = "Pushing…";
+      try {
+        await api(`/portfolio/projects/${project.id}/push`, json("POST", { tracker_id: target.id }));
+        await load();
+      } catch (err) {
+        control.disabled = false;
+        control.textContent = original;
+        showError(err.message);
+      }
+    })();
+  }
+
+  function relativeTime(seconds) {
+    if (!seconds) return "";
+    const diff = Date.now() / 1000 - seconds;
+    if (diff < 60) return "just now";
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}d ago`;
+    return new Date(seconds * 1000).toLocaleDateString();
   }
 
   function deleteButton(entity, record) {
@@ -332,6 +507,15 @@
         title.appendChild(document.createTextNode(" "));
         title.appendChild(flag);
       }
+      if (initiative.in_ideation) {
+        const flag = document.createElement("span");
+        flag.className = "flag ideation";
+        flag.textContent = "in ideation";
+        flag.title = "Derived: every project under this initiative is in ideation " +
+          "(or there are none yet). Graduating one project to open flips this by itself.";
+        title.appendChild(document.createTextNode(" "));
+        title.appendChild(flag);
+      }
       const actions = document.createElement("span");
       actions.className = "actions";
       if (!initiative.is_maintenance) {
@@ -339,6 +523,26 @@
       }
       row.append(title, actions);
       item.appendChild(row);
+
+      if (initiative.description) {
+        const info = document.createElement("button");
+        info.type = "button";
+        info.className = "info-toggle";
+        info.textContent = "ⓘ";
+        info.title = "Show description";
+        const desc = document.createElement("div");
+        desc.className = "desc";
+        desc.textContent = initiative.description;
+        desc.hidden = true;
+        info.addEventListener("click", () => {
+          desc.hidden = !desc.hidden;
+          info.classList.toggle("open", !desc.hidden);
+          info.title = desc.hidden ? "Show description" : "Hide description";
+        });
+        title.appendChild(document.createTextNode(" "));
+        title.appendChild(info);
+        item.appendChild(desc);
+      }
 
       const owned = data.projects.filter((p) => p.initiative_id === initiative.id);
       const meta = document.createElement("div");
@@ -401,10 +605,96 @@
         title.appendChild(document.createTextNode(" "));
         title.appendChild(flag);
       }
+      if (project.status === "ideation") {
+        const flag = document.createElement("span");
+        flag.className = "flag ideation";
+        flag.textContent = "ideation";
+        flag.title = "An idea being worked — expected to have no changes yet.";
+        title.appendChild(document.createTextNode(" "));
+        title.appendChild(flag);
+      }
+      // The tracker rung: a project is tracked as an EPIC in Jira/ADO, 1:1. Linked, it
+      // wears the epic's badge; unlinked (and real — catch-alls are local plumbing by
+      // design) it is flagged as existing only here, pending an upload the sync cannot
+      // do yet. Nothing renders on a deployment with no [[trackers]] at all.
+      const anyCatchAll = project.is_catch_all || project.catch_all_for_initiative;
+      if (data.trackers_configured) {
+        title.appendChild(document.createTextNode(" "));
+        if (project.ticket) {
+          const badge = document.createElement(project.ticket.url ? "a" : "span");
+          badge.className = "ticket-badge" + (project.ticket.unresolved ? " unresolved" : "");
+          badge.dataset.type = project.ticket.type || "other";
+          if (project.ticket.url) {
+            badge.href = project.ticket.url;
+            badge.target = "_blank";
+            badge.rel = "noopener noreferrer";
+          }
+          badge.append(project.ticket.unresolved ? "Not synced · " : "", project.ticket.key);
+          if (project.ticket.state) {
+            const state = document.createElement("span");
+            state.className = "ticket-state";
+            state.textContent = project.ticket.state;
+            badge.append(" ", state);
+          }
+          badge.title = project.ticket.unresolved
+            ? `${project.ticket.key} is linked in ${project.ticket.tracker_label || project.ticket.tracker_id} ` +
+              "but was not in the last sync."
+            : `${project.ticket.raw_type || "Epic"} ${project.ticket.key} — ${project.ticket.title || "(no title)"}\n` +
+              `${project.ticket.tracker_label || project.ticket.tracker_id}` +
+              (project.ticket.state ? ` · ${project.ticket.state}` : "");
+          title.appendChild(badge);
+        } else if (!anyCatchAll && project.status !== "ideation") {
+          // Ideation projects are exempt on purpose, matching pending_upload_report:
+          // an idea has nothing to file an epic for yet - graduating to open is the
+          // moment it earns a ticket, and that is when this flag starts applying.
+          // Clickable, like the roadmap board's chip of the same name: the flag states
+          // the absence, so the action that fixes it belongs on the flag rather than
+          // only on a button further along the row.
+          const targets = pushTrackers(data);
+          const flag = document.createElement(targets.length ? "button" : "span");
+          flag.className = "flag" + (targets.length ? " clickable" : "");
+          flag.textContent = "not in tracker";
+          flag.title = targets.length
+            ? "Only exists here so far. Click to create its epic in the tracker."
+            : "Created locally — no tracker here is set up to create it. " +
+              "If the epic already exists there, link it with the Epic… button.";
+          if (targets.length) {
+            flag.type = "button";
+            flag.addEventListener("click", () => pushEpic(flag, project, targets));
+          }
+          title.appendChild(flag);
+        }
+      }
       const actions = document.createElement("span");
       actions.className = "actions";
+      if (data.trackers_configured && !anyCatchAll) {
+        const epicBtn = document.createElement("button");
+        epicBtn.className = "ghost";
+        epicBtn.textContent = project.ticket ? "Epic…" : "Link epic";
+        epicBtn.title = project.ticket
+          ? `Change or remove the ${project.ticket.key} link`
+          : "Link this project to the epic it is tracked as in Jira/ADO";
+        epicBtn.addEventListener("click", () => {
+          const pasted = prompt(
+            "Paste the epic's URL or key (e.g. PROJ-123).\nLeave blank to unlink — the project then counts as local-only, pending upload.",
+            project.ticket ? project.ticket.key : ""
+          );
+          if (pasted === null) return;
+          act(() => api(`/portfolio/projects/${project.id}`, json("PATCH", { ticket: pasted.trim() })));
+        });
+        actions.append(epicBtn);
+
+        /* Push: create the epic the project doesn't have yet. Only for an UNLINKED,
+           non-ideation project - the same two exemptions pending_upload_report makes,
+           since an idea has nothing to file an epic for and a linked project already
+           has one (the endpoint 409s on both). Absent, not disabled, when no tracker
+           declares a push target. */
+        if (!project.ticket && project.status !== "ideation" && pushTrackers(data).length) {
+          actions.append(pushEpicButton(project, pushTrackers(data)));
+        }
+      }
       if (!project.is_catch_all) {
-        actions.append(lifecycleButton("projects", project), deleteButton("projects", project));
+        actions.append(projectStatusPicker(project), deleteButton("projects", project));
       }
       row.append(title, actions);
       item.appendChild(row);
@@ -433,6 +723,27 @@
         const meta = document.createElement("div");
         meta.className = "meta";
         meta.textContent = `rolls up to ${byId[project.initiative_id]}`;
+        item.appendChild(meta);
+      }
+
+      // An ideation project's liveness comes from session activity, not changes -
+      // there are none by definition. Same readout the board shows on its rows.
+      if (project.status === "ideation") {
+        const activity = (data.activity || {})[project.id];
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        if (activity && activity.recent_sessions) {
+          const span = document.createElement("span");
+          span.className = "activity";
+          span.textContent =
+            `${activity.recent_sessions} session${activity.recent_sessions === 1 ? "" : "s"} recently · ` +
+            `touched ${relativeTime(activity.last_at)}`;
+          meta.appendChild(span);
+        } else if (activity && activity.last_at) {
+          meta.textContent = `last touched ${relativeTime(activity.last_at)}`;
+        } else {
+          meta.textContent = "no activity yet";
+        }
         item.appendChild(meta);
       }
       list.appendChild(item);
@@ -513,10 +824,49 @@
     host.appendChild(banner);
   }
 
+  // Sessions whose scope has drifted from the work model (see server.py's
+  // _session_scope_report). Same principle as the unaligned banner: never blocking, but
+  // never silent either - each of these makes a cost figure quietly mean something other
+  // than what it says.
+  const SCOPE_ISSUE_TEXT = {
+    missing: (row) =>
+      `"${row.label}" is scoped to an initiative that no longer exists. Re-scope it, or ` +
+      "its work keeps landing in the general catch-all.",
+    closed: (row) =>
+      `"${row.label}" is still working in "${row.initiative}", which is closed. Reopen the ` +
+      "initiative or move the session to a current one.",
+    mismatch: (row) =>
+      `"${row.label}" is scoped to "${row.initiative}" but its project "${row.project}" ` +
+      "belongs to a different initiative. Cost follows the project, so the initiative " +
+      "pin is the part that is wrong.",
+  };
+
+  function renderSessionScope() {
+    const host = document.getElementById("session-scope");
+    host.innerHTML = "";
+    const rows = data.session_scope || [];
+    if (!rows.length) return;
+    const banner = document.createElement("div");
+    banner.className = "banner";
+    const heading = document.createElement("strong");
+    heading.textContent = `Session scope needs attention (${rows.length}):`;
+    banner.appendChild(heading);
+    const list = document.createElement("ul");
+    for (const row of rows) {
+      const li = document.createElement("li");
+      const describe = SCOPE_ISSUE_TEXT[row.issue];
+      li.textContent = describe ? describe(row) : `"${row.label}": ${row.issue}`;
+      list.appendChild(li);
+    }
+    banner.appendChild(list);
+    host.appendChild(banner);
+  }
+
   async function load() {
     data = await api("/portfolio/data");
     renderBootstrap();
     renderUnaligned();
+    renderSessionScope();
     renderGoals();
     renderInitiatives();
     renderProjects();
@@ -544,12 +894,15 @@
     event.preventDefault();
     const input = document.getElementById("project-title");
     const picker = document.getElementById("project-initiative");
+    const ideation = document.getElementById("project-ideation");
     act(async () => {
       await api("/portfolio/projects", json("POST", {
         title: input.value,
         initiative_id: picker.value,
+        status: ideation.checked ? "ideation" : "open",
       }));
       input.value = "";
+      ideation.checked = false;
     });
   });
 

@@ -74,13 +74,36 @@ Roadmap items can optionally hang off a strategy chain, visible at `/portfolio`:
 
 ```
 Goals  ⇄  Initiative  →  Project  →  Change
-                                       └─ belongs to exactly one Product
+                                       ├─ belongs to exactly one Product  (its board)
+                                       └─ belongs to exactly one System   (its code)
 ```
 
 A **Change** is just the roadmap item you already have — it gains one parent project.
 A project belongs to exactly one initiative, and an initiative may serve **several
 goals**. Products aren't a level in the chain; a product hangs off the change, which is
 what lets an initiative span several products without any extra bookkeeping.
+
+Products have a hierarchy of their own, separate from the chain above: a product can
+declare a `parent`, making it a **sub-product**, nested as deep as your org actually is.
+A sub-product is a full product — its own board, sessions and ids — and a PM sees and
+writes its whole subtree, while the board nests each child inside its parent's section.
+See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#hierarchical-products).
+
+### Products and systems
+
+A **product** is business-facing — a line of business, or an umbrella over the technology
+that serves one. A **system** is a bounded piece of technology: a service, an app, a
+module, with its own source folder and/or repo. They are different shapes, and the
+relationship between them is **many-to-many**: a product touches several systems, and a
+system serves several products.
+
+A change belongs to exactly one system — that is what makes its blast radius knowable —
+and systems are declared in `[systems]`, with each product listing what it touches. The
+catalogue lives at `/systems`. Declaring the table is the switch: leave it out and
+nothing changes anywhere. Systems deliberately own **no** roadmap — roadmaps are
+product- and initiative-first, and work that belongs to a system rather than a product
+(infra, performance) is an initiative. See
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#systems).
 
 A project with no initiative is **unaligned** — allowed, so nobody is blocked
 mid-work, but reported so it gets linked up. Declare a maintenance goal + always-open
@@ -96,6 +119,25 @@ rather than dropping out of view.
 
 Entirely optional and entirely additive: existing boards load unchanged, and a
 deployment that ignores `/portfolio` behaves exactly as before.
+
+### Sessions that work in an initiative
+
+A session can be pinned to a product, scoped to an **initiative**, or both. The second is
+for enterprise work that genuinely spans several integrated products, where pinning one
+board would be a lie about the scope.
+
+Such a session reads its whole initiative every turn — its projects and their changes,
+across every board they sit on — but starts able to **write** nowhere. Which products an
+initiative actually touches is something the PM works out as the conversation goes; when
+it establishes that one is affected, it **adopts** that board, says so, and gains write
+access to it from the next turn. Adopting a parent adopts its sub-products, same as
+pinning always has.
+
+The two axes stay separate on purpose: the initiative is what the session is *about* and
+where its cost lands, the products are what it may *change*. Its turns are attributed to
+that initiative from the very first one, not to maintenance — and a session whose scope
+drifts (initiative closed, deleted, or disagreeing with its project) is reported on
+`/portfolio` rather than silently making a cost figure mean something else.
 
 ## Migrating an existing locally-built pm_agent
 
@@ -161,7 +203,11 @@ they live in your workspace, never in this package.
 In `personal` mode this is a single-trusted-user, local-only tool: everything binds to
 127.0.0.1 and dev agents run with bypassed permissions inside your repo. Do not expose
 the port. PM agents run under a strict literal-match Bash allowlist that structurally
-scopes them to their own session and their own product's board.
+scopes them to their own session and to the product boards they own — their own, plus
+their sub-products' if they are pinned to a parent, plus any board an initiative-scoped
+session has explicitly adopted, and nothing else. Adoption widens that allowlist, which is
+why it is an explicit call a PM makes for its own session and never something inferred
+from the conversation.
 
 Credential-bearing state (`accounts.json`, `costing.json`, `audit.jsonl`,
 `activity.jsonl`) is **unstaged from every snapshot commit unconditionally**, not merely

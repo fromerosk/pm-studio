@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8" />
 <title>PM Studio — Chat</title>
+<link rel="stylesheet" href="/static/nav.css" />
+<script src="/static/nav.js"></script>
 <style>
   :root {
     color-scheme: light dark;
@@ -99,7 +101,8 @@
     flex-direction: column;
     overflow: hidden;
   }
-  #model-select {
+  #model-select,
+  #mode-select {
     font: inherit;
     font-size: 0.8em;
     font-weight: 500;
@@ -110,7 +113,11 @@
     padding: 2px 6px;
     margin-left: 6px;
   }
-  #model-select:disabled { opacity: 0.6; }
+  #model-select:disabled,
+  #mode-select:disabled { opacity: 0.6; }
+  /* In research mode the pill takes the accent, so "this session can't dispatch dev
+     work" is visible from the header without opening the select. */
+  #mode-select.research { color: var(--accent); border-color: var(--accent); }
   #log {
     flex: 1;
     overflow-y: auto;
@@ -131,6 +138,19 @@
   }
   .row.user .bubble { background: var(--bubble-user); color: var(--bubble-user-fg); }
   .row.pm .bubble { background: var(--bubble-pm); color: var(--bubble-pm-fg); }
+  /* A message the session has accepted but not started yet: still the stakeholder's
+     own bubble, dimmed and tagged so it reads as "sent, waiting its turn" rather than
+     as one the PM has already seen. */
+  .row.user.queued .bubble { opacity: 0.65; }
+  .row.user.queued .bubble::after {
+    content: "Queued";
+    display: block;
+    margin-top: 4px;
+    font-size: 0.72em;
+    font-style: italic;
+    letter-spacing: 0.02em;
+    opacity: 0.85;
+  }
   .row.status .bubble {
     background: transparent;
     color: var(--muted);
@@ -296,6 +316,15 @@
     50% { box-shadow: 0 0 0 3px rgba(42, 120, 214, 0.14); }
   }
   .task-card .description { font-weight: 500; }
+  /* Compliance-judge verdict on a finished task: a one-line disclosure whose color
+     carries the verdict, expanding into the cited violations / summary. */
+  .task-card .judge-line { margin-top: 8px; font-size: 0.9em; }
+  .task-card .judge-line summary { cursor: pointer; }
+  .judge-verdict { font-weight: 600; }
+  .judge-verdict.pass { color: var(--status-done); }
+  .judge-verdict.violation { color: var(--status-error); }
+  .judge-verdict.inconclusive { color: var(--status-running); }
+  .task-card .judge-body { margin-top: 6px; white-space: pre-wrap; }
   .card {
     background: var(--bg);
     border: 1px solid var(--border);
@@ -439,7 +468,13 @@
 </style>
 </head>
 <body>
-<header><a href="/" style="color:var(--muted);text-decoration:none;font-size:0.85em;">&larr; Sessions</a> &middot; <span id="session-title">PM Chat</span><span id="product-badge"></span> <select id="model-select" title="Claude model for this session's PM turns and dev tasks"></select> &middot; <button id="reset-btn" type="button" style="background:none;border:none;color:var(--muted);font:inherit;font-size:0.85em;cursor:pointer;padding:0;text-decoration:underline;">Reset chat</button><div id="session-goal"></div></header>
+<!-- "Sessions › this session" and the Chat / Dev lifecycle sub-tabs come from the shared
+     nav; the header keeps only what acts on this session. -->
+<div id="pm-nav" data-page="chat"></div>
+<header><span id="product-badge"></span><select id="model-select" title="Claude model for this session's PM turns and dev tasks"></select><select id="mode-select" title="Build: the PM dispatches dev tasks that change code. Research / strategy: it can't - research, specs and planning only, until you switch it back.">
+  <option value="build">Build</option>
+  <option value="research">Research / strategy</option>
+</select> &middot; <button id="reset-btn" type="button" style="background:none;border:none;color:var(--muted);font:inherit;font-size:0.85em;cursor:pointer;padding:0;text-decoration:underline;">Reset chat</button><div id="session-goal"></div></header>
 <div id="session-strip">
   <button id="strip-summary" type="button" aria-expanded="false" title="Session lifecycle">
     <span id="strip-summary-content"></span>
@@ -479,18 +514,23 @@
   // URL is /chat/{session_id}
   const sessionId = location.pathname.split("/").filter(Boolean).pop();
 
-  const sessionTitleEl = document.getElementById("session-title");
   const sessionGoalEl = document.getElementById("session-goal");
   const productBadgeEl = document.getElementById("product-badge");
   const modelSelectEl = document.getElementById("model-select");
+  const modeSelectEl = document.getElementById("mode-select");
   let availableModels = null; // [{id, label}], once /models resolves
 
+  function applyMode(mode) {
+    modeSelectEl.value = mode;
+    modeSelectEl.dataset.pendingMode = mode;
+    modeSelectEl.classList.toggle("research", mode === "research");
+  }
+
   function applySessionMeta(session) {
-    // Prefer the PM-maintained title, falling back to the creation name (consistent with
-    // the sessions list); show the goal as a muted subtitle when present.
-    const heading = (session && (session.title || session.name)) || "PM Chat";
-    sessionTitleEl.textContent = heading;
-    document.title = heading;
+    // The heading itself is the nav's breadcrumb now, so this only names the tab -
+    // repeating the title one line under the trail was pure duplication. Same precedence
+    // as the sessions list: PM-maintained title, then the creation name.
+    document.title = (session && (session.title || session.name)) || "PM Chat";
     const goal = session && (session.goal || "").trim();
     if (goal) {
       sessionGoalEl.textContent = goal;
@@ -502,8 +542,22 @@
       fetch("/roadmap/data")
         .then((r) => (r.ok ? r.json() : null))
         .then((data) => {
-          const label = (data && data.products && data.products[session.product]) || session.product;
-          productBadgeEl.textContent = label;
+          const products = (data && data.products) || {};
+          const parents = (data && data.product_parents) || {};
+          // The full path - "Web App / Auth / SSO" - walked up however deep the taxonomy
+          // goes: which family this PM belongs to is part of who it is, and the badge is
+          // the only place this page says it. `seen` is the cyclic-config guard the other
+          // pages carry too (the server refuses one at load; a hang here would blank the
+          // session header).
+          const path = [session.product];
+          const seen = new Set(path);
+          let cursor = parents[session.product];
+          while (cursor && !seen.has(cursor)) {
+            path.unshift(cursor);
+            seen.add(cursor);
+            cursor = parents[cursor];
+          }
+          productBadgeEl.textContent = path.map((p) => products[p] || p).join(" / ");
           productBadgeEl.style.display = "inline-block";
         })
         .catch(() => {});
@@ -513,6 +567,8 @@
       modelSelectEl.dataset.pendingModel = session.model;
       populateModelSelect(session.model);
     }
+    // Sessions that predate the mode field arrive without one - they are build sessions.
+    applyMode((session && session.mode) || "build");
   }
 
   function populateModelSelect(currentModel) {
@@ -526,10 +582,9 @@
     modelSelectEl.value = currentModel;
   }
 
-  fetch(`/sessions/${sessionId}`)
-    .then((r) => (r.ok ? r.json() : null))
-    .then(applySessionMeta)
-    .catch(() => applySessionMeta(null));
+  // The shared nav already fetched this to build the breadcrumb; reuse its promise
+  // rather than asking for the same session a second time.
+  PMNav.session.then(applySessionMeta).catch(() => applySessionMeta(null));
 
   // ---- session lifecycle strip (compact, collapsible, under the header) ----
 
@@ -749,6 +804,7 @@
         <div class="description"></div>
       </details>
       ${task.result ? `<details><summary>Result</summary><pre></pre></details>` : ""}
+      ${task.judge ? `<details class="judge-line"><summary><span class="judge-verdict ${task.judge.verdict}"></span></summary><div class="judge-body"></div></details>` : ""}
     `;
     const desc = (task.description ?? "").trim();
     // Collapsed preview: first line, truncated to a short one-line snippet.
@@ -758,6 +814,20 @@
     card.querySelector(".description").textContent = task.description;
     if (task.result) {
       card.querySelector("pre").textContent = task.result;
+    }
+    if (task.judge) {
+      const judge = task.judge;
+      const count = (judge.violations ?? []).length;
+      const label =
+        judge.verdict === "pass" ? "Git rules: compliant"
+        : judge.verdict === "violation" ? `Git rules: ${count} violation${count === 1 ? "" : "s"}`
+        : "Git rules: unverified";
+      card.querySelector(".judge-verdict").textContent = label;
+      const lines = (judge.violations ?? []).map(
+        (v) => `• ${v.rule}${v.evidence ? ` — ${v.evidence}` : ""}`
+      );
+      if (judge.summary) lines.push(judge.summary);
+      card.querySelector(".judge-body").textContent = lines.join("\n") || "No detail recorded.";
     }
     return card;
   }
@@ -844,7 +914,11 @@
     sessionsSocket.onclose = () => setTimeout(connectSessions, RECONNECT_DELAY_MS);
     sessionsSocket.onmessage = (msg) => {
       const event = JSON.parse(msg.data);
-      if (event.session && event.session.id === sessionId) renderSessionStrip(event.session);
+      if (event.session && event.session.id === sessionId) {
+        renderSessionStrip(event.session);
+        // Mode can be flipped from another tab (or by an admin); keep the header pill live.
+        if (!modeSelectEl.disabled) applyMode(event.session.mode || "build");
+      }
     };
   }
 
@@ -874,6 +948,24 @@
       .then((session) => { modelSelectEl.dataset.pendingModel = session.model; modelSelectEl.value = session.model; })
       .catch((err) => { alert(err.message); modelSelectEl.value = previous; })
       .finally(() => { modelSelectEl.disabled = false; });
+  });
+
+  modeSelectEl.addEventListener("change", () => {
+    const chosen = modeSelectEl.value;
+    const previous = modeSelectEl.dataset.pendingMode || chosen;
+    modeSelectEl.disabled = true;
+    fetch(`/sessions/${sessionId}/mode`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: chosen }),
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((body) => { throw new Error(body.detail ?? "mode change failed"); });
+        return r.json();
+      })
+      .then((session) => { applyMode(session.mode || "build"); })
+      .catch((err) => { alert(err.message); applyMode(previous); })
+      .finally(() => { modeSelectEl.disabled = false; });
   });
 
   let chatSocket = null;
@@ -983,12 +1075,20 @@
     });
   }
 
-  function setBusy(busy) {
-    sendBtn.disabled = busy;
-    input.disabled = busy;
+  // The composer is NOT disabled while the PM is thinking - you can keep typing and
+  // keep sending, and the server queues each message onto the session to run in order
+  // (see _enqueue_pm_turn). This locks the composer only when there is nothing left to
+  // talk to: a session the server says is gone.
+  function setLocked(locked) {
+    sendBtn.disabled = locked;
+    input.disabled = locked;
   }
 
   let sessionGone = false; // set when the server tells us this session no longer exists
+  // Bubbles this tab has drawn for messages it sent, waiting on the session's receipt
+  // (pm_queued) to learn the id they were filed under. FIFO: the server acks in the
+  // order it receives.
+  let awaitingAck = [];
 
   function connectChat() {
     chatSocket = new WebSocket(`ws://${location.host}/ws/chat/${sessionId}`);
@@ -996,30 +1096,44 @@
     chatSocket.onclose = () => {
       if (sessionGone) return; // don't loop forever reconnecting to a session that's archived/gone
       addRow("status", "Disconnected - reconnecting...");
-      setBusy(false);
+      awaitingAck = []; // receipts for anything in flight died with the connection
       setTimeout(connectChat, RECONNECT_DELAY_MS);
     };
     chatSocket.onmessage = (msg) => {
       const event = JSON.parse(msg.data);
       // event.auto marks a turn the PM ran on its own after a dev task finished, not one
-      // this tab asked for - it must never touch setBusy, which tracks whether THIS tab's
-      // own in-flight request (if any) is still running.
+      // this tab asked for.
       switch (event.type) {
+        case "pm_queued": {
+          // The session's receipt for a message this tab just sent: it is filed under
+          // event.id, and event.ahead says how many messages are still in front of it.
+          // Acks arrive in send order, so they pair off with the bubbles awaiting one.
+          const row = awaitingAck.shift();
+          if (row) {
+            row.dataset.queuedId = event.id;
+            if (event.ahead > 0) row.classList.add("queued");
+          }
+          break;
+        }
         case "pm_working":
+          // A turn starting on a message this page drew as queued (hydrated after a
+          // reload): it is a plain sent message now.
+          if (event.queued_id) {
+            const queued = log.querySelector(`.row.queued[data-queued-id="${event.queued_id}"]`);
+            if (queued) queued.classList.remove("queued");
+          }
           addRow("status", event.auto ? "PM is checking a finished task..." : "PM is thinking...");
           break;
         case "pm_reply":
           addRow("pm", event.text);
-          if (!event.auto) setBusy(false);
           break;
         case "pm_error":
           addRow("status", `Error: ${event.message}`);
-          if (!event.auto) setBusy(false);
           break;
         case "error":
           sessionGone = true;
           addRow("status", `${event.message} - this session may have been merged and cleaned up.`);
-          setBusy(true);
+          setLocked(true);
           break;
       }
     };
@@ -1088,14 +1202,37 @@
     }
   }
 
+  // Queued messages, appended after the transcript: everything in the timeline above
+  // has already had its turn, and these are what happens next. A record whose turn
+  // started between the two fetches is in BOTH responses (the transcript entry carries
+  // the same id) - drawing it once, from the transcript, is what the id is for.
+  function renderPendingMessages(entries, pending) {
+    const transcribed = new Set(entries.map((entry) => entry.id).filter(Boolean));
+    for (const record of pending) {
+      if (transcribed.has(record.id)) continue;
+      const imageSrcs = (record.attachments || []).map(
+        (filename) => `/chat/${sessionId}/uploads/${filename}`
+      );
+      const row = buildRow("user", record.text, imageSrcs);
+      row.classList.add("queued");
+      row.dataset.queuedId = record.id;
+      tagItemTs(row, record.ts);
+      log.appendChild(row);
+    }
+  }
+
   function hydrate() {
     return Promise.all([
       fetch(`/history/${sessionId}`).then((r) => r.json()).catch(() => []),
       fetch(`/tasks/${sessionId}`).then((r) => r.json()).catch(() => []),
       // Live activity so a mid-turn reload can tell the PM turn is still in flight.
       fetch(`/sessions/${sessionId}`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
-    ]).then(([entries, tasks, session]) => {
+      // Messages accepted while the PM was thinking and not started yet - they are on
+      // the session, not in this tab, so a reload has to ask for them.
+      fetch(`/chat/${sessionId}/pending`).then((r) => (r.ok ? r.json() : [])).catch(() => []),
+    ]).then(([entries, tasks, session, pending]) => {
       hydrateTimeline(entries || [], tasks || []);
+      renderPendingMessages(entries || [], pending || []);
       // First visit (no stored watermark): treat everything present as read, so no
       // divider appears. On later visits, keep the stored watermark so unread that
       // arrived while away is surfaced (divider + count) below.
@@ -1147,7 +1284,8 @@
     e.preventDefault();
     const text = input.value.trim();
     if ((!text && !pendingAttachments.length) || !chatSocket || chatSocket.readyState !== WebSocket.OPEN) return;
-    addRow("user", text, pendingAttachments.map((a) => a.dataUrl));
+    const bubble = addRow("user", text, pendingAttachments.map((a) => a.dataUrl));
+    awaitingAck.push(bubble.closest(".row"));
     chatSocket.send(JSON.stringify({
       text,
       attachments: pendingAttachments.map(({ filename, mime, data }) => ({ filename, mime, data })),
@@ -1155,7 +1293,6 @@
     input.value = "";
     pendingAttachments = [];
     renderPendingPreviews();
-    setBusy(true);
   });
 
   input.addEventListener("keydown", (e) => {

@@ -1,0 +1,388 @@
+/* Shared chrome for every page in the studio.
+ *
+ * Deliberately self-contained on two axes:
+ *
+ * - It borrows no tokens. Each page declares its own `:root` palette under its own
+ *   names (chat.html uses --bg/--fg/--muted, the board pages use
+ *   --page/--ink-primary/...), so the nav defines --pmnav-* instead and looks identical
+ *   wherever it is mounted.
+ * - It resists the host page's CSS. Several pages style bare elements - portfolio.html
+ *   puts a border and padding on every `li`, for instance - and those rules would
+ *   otherwise land on the nav's own markup. So every selector below is scoped to
+ *   `#pm-nav`, which outranks any class- or type-level rule a page can write, and the
+ *   block right after the tokens neutralises the inherited properties the component
+ *   cares about. Add nothing here that is not `#pm-nav`-prefixed.
+ *
+ * Two rows, and the split is the point:
+ *   1. the bar     - the ONLY place destinations are listed, current one marked. The
+ *      arrows between the first three are the work model (intent narrowing into work),
+ *      drawn where the links already are rather than as a second copy of them below.
+ *   2. the context - what the page you are on holds, plus a slot the page fills with
+ *      its own view controls; for the pages nested inside a session, a breadcrumb trail
+ *      and that session's sub-tabs instead.
+ *
+ * Row 2 used to repeat rows 1's three links as a flow map, directly beneath them. It
+ * read as two menus. Anything added here must not re-list what the bar already shows.
+ */
+
+:root {
+  --pmnav-surface: #fcfcfb;
+  --pmnav-context: #f3f2ef;
+  --pmnav-ink: #0b0b0b;
+  --pmnav-ink-secondary: #52514e;
+  --pmnav-ink-muted: #898781;
+  --pmnav-border: rgba(11, 11, 11, 0.12);
+  --pmnav-accent: #2a78d6;
+  --pmnav-active-bg: rgba(42, 120, 214, 0.10);
+  --pmnav-hover-bg: rgba(11, 11, 11, 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --pmnav-surface: #1a1a19;
+    --pmnav-context: #131312;
+    --pmnav-ink: #ffffff;
+    --pmnav-ink-secondary: #c3c2b7;
+    --pmnav-ink-muted: #898781;
+    --pmnav-border: rgba(255, 255, 255, 0.13);
+    --pmnav-accent: #3987e5;
+    --pmnav-active-bg: rgba(57, 135, 229, 0.16);
+    --pmnav-hover-bg: rgba(255, 255, 255, 0.07);
+  }
+}
+
+/* `flex: 0 0 auto` is for chat.html, whose body is a full-height flex column - without
+   it the nav would be squeezed by the message list. Harmless on the block pages. */
+#pm-nav {
+  flex: 0 0 auto;
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 16px;
+  line-height: 1.4;
+  color: var(--pmnav-ink);
+  background: var(--pmnav-surface);
+  border-bottom: 1px solid var(--pmnav-border);
+}
+
+/* The defensive reset. See the header comment: this is what keeps a page's bare `li`,
+   `button` or `a` rules from reshaping the nav. Every component rule below is also
+   #pm-nav-scoped, so it carries a class and still wins against this. */
+#pm-nav div,
+#pm-nav nav,
+#pm-nav ol,
+#pm-nav li,
+#pm-nav a,
+#pm-nav span,
+#pm-nav button {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  list-style: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  text-decoration: none;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: 1;
+  box-shadow: none;
+}
+
+/* Nothing renders until the JS knows which links this role may see; reserving the height
+   of the two rows (44px bar + 1px rule + 32px context) keeps the page below from jumping
+   once it does. */
+#pm-nav:empty { min-height: 77px; }
+
+/* ---- row 1: the bar ---- */
+
+#pm-nav .pmnav-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 18px;
+  min-height: 44px;
+}
+
+#pm-nav .pmnav-brand {
+  font-size: 0.92em;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--pmnav-ink);
+  white-space: nowrap;
+}
+
+#pm-nav .pmnav-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+
+#pm-nav .pmnav-tab {
+  display: block;
+  padding: 5px 11px;
+  border-radius: 7px;
+  font-size: 0.86em;
+  font-weight: 500;
+  color: var(--pmnav-ink-secondary);
+  white-space: nowrap;
+}
+
+#pm-nav .pmnav-tab:hover { background: var(--pmnav-hover-bg); color: var(--pmnav-ink); }
+
+/* The "you are here" marker. Weight plus a tinted chip rather than colour alone, so it
+   survives a colour-blind reader and a greyscale screenshot. */
+#pm-nav .pmnav-tab[aria-current="page"] {
+  background: var(--pmnav-active-bg);
+  color: var(--pmnav-accent);
+  font-weight: 650;
+}
+
+#pm-nav .pmnav-group-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 9px 7px;
+  background: var(--pmnav-border);
+}
+
+#pm-nav .pmnav-spacer { flex: 1 1 auto; }
+
+#pm-nav .pmnav-id {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.82em;
+  color: var(--pmnav-ink-muted);
+  white-space: nowrap;
+}
+
+#pm-nav .pmnav-id-name { color: var(--pmnav-ink-secondary); font-weight: 500; }
+
+#pm-nav .pmnav-role {
+  padding: 1px 7px;
+  border: 1px solid var(--pmnav-border);
+  border-radius: 999px;
+  font-size: 0.92em;
+}
+
+#pm-nav .pmnav-signout {
+  color: var(--pmnav-ink-muted);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+#pm-nav .pmnav-signout:hover { color: var(--pmnav-ink); }
+
+/* ---- row 2: context ---- */
+
+#pm-nav .pmnav-context {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 5px 18px;
+  min-height: 32px;
+  background: var(--pmnav-context);
+  border-top: 1px solid var(--pmnav-border);
+  font-size: 0.8em;
+}
+
+/* Where you are, said once. This is a label, NOT a link - the tab above is the link,
+   and lighting up two copies of the same destination is what made the chrome read as
+   two menus. */
+#pm-nav .pmnav-where {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+#pm-nav .pmnav-where-name { font-weight: 650; color: var(--pmnav-ink); white-space: nowrap; }
+#pm-nav .pmnav-where-what { color: var(--pmnav-ink-muted); }
+
+/* The page's own controls (the roadmap's grouping and view toggles, for instance). It
+   is always in the DOM so the row's height never depends on the page, and it pushes
+   right so the two halves of the row don't run together. */
+#pm-nav .pmnav-slot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+#pm-nav .pmnav-slot:empty { display: none; }
+
+/* The one control shape offered to pages mounting into the slot: a segmented switch
+   between mutually exclusive views of the same data. Lives here rather than in each
+   page so two pages' toggles can't drift apart, and so the defensive reset above
+   doesn't flatten them.
+
+     <div class="pmnav-seg" role="group" aria-label="...">
+       <button type="button" aria-pressed="true">Board</button>
+       ...
+
+   `aria-pressed` is the state - there is no separate "active" class to keep in sync,
+   and a screen reader gets the same signal the styling does. */
+#pm-nav .pmnav-seg {
+  display: inline-flex;
+  align-items: stretch;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--pmnav-hover-bg);
+}
+
+#pm-nav .pmnav-seg button {
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-size: 0.98em;
+  font-weight: 500;
+  color: var(--pmnav-ink-secondary);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+#pm-nav .pmnav-seg button:hover { color: var(--pmnav-ink); }
+
+#pm-nav .pmnav-seg button[aria-pressed="true"] {
+  background: var(--pmnav-surface);
+  color: var(--pmnav-accent);
+  font-weight: 650;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.10);
+}
+
+#pm-nav .pmnav-seg-label {
+  align-self: center;
+  color: var(--pmnav-ink-muted);
+  white-space: nowrap;
+}
+
+/* The slot's second control shape: a one-shot action, as opposed to the segmented
+   switch above which reports a state. Outlined rather than filled - it sits next to
+   the view toggles and must not out-shout the thing they are toggling. */
+#pm-nav .pmnav-action {
+  padding: 3px 10px;
+  border: 1px solid var(--pmnav-border);
+  border-radius: 7px;
+  font-size: 0.98em;
+  font-weight: 500;
+  color: var(--pmnav-ink-secondary);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+#pm-nav .pmnav-action:hover:not(:disabled) {
+  border-color: var(--pmnav-accent);
+  color: var(--pmnav-accent);
+}
+
+#pm-nav .pmnav-action:disabled { opacity: 0.45; cursor: default; }
+
+/* The slot's third control shape: an open-text filter. An input, which the defensive
+   reset above does not cover - so this rule carries its own full reset the same way
+   that block does, and a host page's bare `input` styling cannot reshape it. Sized to
+   sit level with the segmented switches beside it. */
+#pm-nav .pmnav-search {
+  box-sizing: border-box;
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  width: 12em;
+  padding: 3px 10px;
+  border: 1px solid var(--pmnav-border);
+  border-radius: 7px;
+  font: inherit;
+  font-size: 0.98em;
+  color: var(--pmnav-ink);
+  background: var(--pmnav-surface);
+}
+
+#pm-nav .pmnav-search::placeholder { color: var(--pmnav-ink-muted); }
+
+#pm-nav .pmnav-search:focus {
+  outline: none;
+  border-color: var(--pmnav-accent);
+}
+
+/* Between the three work-model tabs in the bar. Decorative: the tabs are the
+   navigation, this is only the relationship between them. */
+#pm-nav .pmnav-arrow {
+  color: var(--pmnav-ink-muted);
+  padding: 0 1px;
+  font-size: 0.86em;
+  user-select: none;
+}
+
+/* Breadcrumbs, for the genuinely nested pages: a session's chat and its dev lifecycle. */
+#pm-nav .pmnav-crumbs {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+#pm-nav .pmnav-crumbs a { color: var(--pmnav-ink-secondary); }
+#pm-nav .pmnav-crumbs a:hover { text-decoration: underline; color: var(--pmnav-ink); }
+#pm-nav .pmnav-chev { color: var(--pmnav-ink-muted); }
+
+#pm-nav .pmnav-crumb-current {
+  display: block;
+  font-weight: 600;
+  color: var(--pmnav-ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 42ch;
+}
+
+/* Sub-tabs move between the two views of one session without leaving it - before this,
+   /dashboard/{id} had no inbound link from anywhere at all. */
+#pm-nav .pmnav-subtabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-left: 12px;
+  border-left: 1px solid var(--pmnav-border);
+}
+
+#pm-nav .pmnav-subtab {
+  padding: 3px 9px;
+  border-radius: 6px;
+  color: var(--pmnav-ink-secondary);
+  font-weight: 500;
+}
+
+#pm-nav .pmnav-subtab:hover { background: var(--pmnav-hover-bg); color: var(--pmnav-ink); }
+
+#pm-nav .pmnav-subtab[aria-current="page"] {
+  background: var(--pmnav-active-bg);
+  color: var(--pmnav-accent);
+  font-weight: 650;
+}
+
+/* ---- narrow screens ---- */
+
+@media (max-width: 900px) {
+  /* The descriptor is the first thing to go: the page's own controls in the slot are
+     worth more room than a restatement of what the page is. */
+  #pm-nav .pmnav-where-what { display: none; }
+}
+
+@media (max-width: 640px) {
+  #pm-nav .pmnav-bar { flex-wrap: wrap; gap: 8px; padding: 8px 14px; }
+  #pm-nav .pmnav-spacer { display: none; }
+  #pm-nav .pmnav-arrow { display: none; }
+  #pm-nav .pmnav-context { padding: 5px 14px; }
+  #pm-nav .pmnav-slot { margin-left: 0; }
+  #pm-nav .pmnav-crumb-current { max-width: 24ch; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  #pm-nav .pmnav-tab,
+  #pm-nav .pmnav-subtab { transition: background 0.12s ease; }
+}

@@ -5,7 +5,7 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -13,7 +13,7 @@ from . import gitsnapshot
 from .agent import PMAgent
 from .config import CONFIG
 from .models import DEFAULT_MODEL, validate_model
-from .roadmap import PRODUCTS
+from .roadmap import PRODUCTS, owned_subtrees
 from .tasks import TaskRegistry
 
 REPO_ROOT = CONFIG.repo_root
@@ -23,6 +23,27 @@ SESSIONS_REGISTRY_PATH = CONFIG.workspace_dir / "sessions.json"
 DEFAULT_SESSION_ID = "default"
 
 Status = Literal["active", "merging", "merged", "conflict", "archived"]
+
+# What a session is FOR - which is a different axis from every other field on it:
+#
+#   build    -> today's behavior: the PM specs work and dispatches dev tasks to build it.
+#   research -> ideation / strategy / planning only: the PM researches, writes specs and
+#               docs, and works the roadmap, but CANNOT dispatch dev tasks - no product
+#               code gets written or changed from this session until the stakeholder
+#               switches it to build.
+#
+# Enforced structurally, not by asking nicely: agent.py omits the dev-task dispatch curl
+# from a research session's Bash allowlist (and tells the PM so), and server.py's
+# POST /tasks/{session_id} refuses with a 403 regardless of who asks - the same
+# belt-and-suspenders pairing that scopes roadmap writes.
+Mode = Literal["build", "research"]
+MODES: tuple[str, ...] = ("build", "research")
+
+
+def validate_mode(mode: str) -> str:
+    if mode not in MODES:
+        raise ValueError(f"Unknown session mode: {mode!r} (valid: {', '.join(MODES)})")
+    return mode
 
 # git status --porcelain codes for unmerged (conflicted) paths.
 _UNMERGED_CODES = ("UU ", "AA ", "DD ", "AU ", "UA ", "UD ", "DU ")
@@ -59,6 +80,12 @@ class Session:
     # on. Defaults to Opus so pre-existing sessions.json records with no "model" key
     # (written before this field existed) keep today's behavior unchanged.
     model: str = DEFAULT_MODEL
+    # What this session is for - "build" or "research" (see Mode above). Defaults to
+    # "build" so pre-existing sessions.json records load unchanged with today's behavior;
+    # live-switchable via SessionManager.set_mode, because ideation regularly graduates
+    # into building (and a build session sometimes needs to be parked back into
+    # research while a decision is pending).
+    mode: str = "build"
     # Self-updating identity the PM maintains itself over the conversation (see
     # agent.py's session_meta curl + SessionManager.set_meta), the way claude.ai
     # auto-titles a chat: `title` is a ~2-5 word abbreviation shown as the session's
@@ -74,9 +101,49 @@ class Session:
     # without this there is nothing to attribute activity to. A session with no
     # project falls back to the catch-all (see server.py's _session_project_id).
     project_id: str | None = None
+    # Which Initiative (see portfolio.py) this session is working IN - the other axis of
+    # scope, orthogonal to `product` and to `project_id`:
+    #
+    #   product       -> which boards this session may write to (a capability, enforced
+    #                    by agent.py's allowlist)
+    #   initiative_id -> what the session is about (its context and its attribution)
+    #
+    # Set for the case `product` cannot express: an initiative that cuts across several
+    # integrated products, where pinning one board would be a lie about the work. Such a
+    # session starts owning no board at all and adopts them as it identifies which
+    # products are actually affected (see `adopted_products`). All four combinations are
+    # meaningful and none is a special case: product only (a single product's PM),
+    # initiative only (broad, products still to be found), both ("this board's share of
+    # that initiative"), neither (the default session's shallow awareness).
+    #
+    # Validated by the caller, not here - the session registry has no business knowing
+    # about the portfolio store, the same reason `project_id` is validated in server.py.
+    # A session can outlive the initiative it names, so every reader treats an id that no
+    # longer resolves as "unscoped" rather than an error.
+    initiative_id: str | None = None
+    # Boards this session has claimed write authority over beyond `product`, grown as an
+    # initiative-scoped session works out which products it touches. Ownership is by
+    # subtree, so adopting a parent adopts its children (see roadmap.owned_subtrees).
+    #
+    # Adoption is an explicit event rather than passive discovery because this list feeds
+    # agent.py's PATCH allowlist, which is the actual enforcement boundary - a session
+    # cannot drift into write access to a board nobody decided it owns.
+    adopted_products: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def owned_products(self) -> list[str]:
+        """Every board this session may write to: its pinned product's subtree plus each
+        adopted product's subtree. Empty for a session that owns nothing - the default
+        session, and an initiative-scoped one that hasn't adopted anything yet.
+
+        The single definition of ownership, used for the roadmap context a turn is given
+        AND for the allowlist that enforces it, so the two cannot disagree about what
+        this session owns.
+        """
+        pinned = [self.product] if self.product else []
+        return owned_subtrees([*pinned, *self.adopted_products])
 
     @classmethod
     def from_dict(cls, data: dict) -> "Session":
@@ -130,6 +197,10 @@ class SessionManager:
                 # the dataclass field above - just persist that default explicitly so
                 # sessions.json stops being silently stale about it.
                 if "model" not in data:
+                    dirty = True
+                # Same migration posture for `mode`: pre-existing records are build
+                # sessions, persisted explicitly on first load.
+                if "mode" not in data:
                     dirty = True
 
         if DEFAULT_SESSION_ID not in self._sessions:
@@ -286,10 +357,13 @@ class SessionManager:
         product: str | None = None,
         model: str | None = None,
         project_id: str | None = None,
+        initiative_id: str | None = None,
+        mode: str | None = None,
     ) -> Session:
         if product is not None and product not in PRODUCTS:
             raise ValueError(f"Unknown product: {product}")
         model = validate_model(model) if model is not None else DEFAULT_MODEL
+        mode = validate_mode(mode) if mode is not None else "build"
         with self._registry_lock:
             session_id = uuid.uuid4().hex[:8]
             branch = f"session/{session_id}"
@@ -312,7 +386,9 @@ class SessionManager:
                 is_default=False,
                 product=product,
                 model=model,
+                mode=mode,
                 project_id=project_id,
+                initiative_id=initiative_id,
             )
             self._sessions[session_id] = session
             self._save()
@@ -701,6 +777,76 @@ class SessionManager:
         self._broadcast({"type": "session_updated", "session": session.to_dict()})
         return session
 
+    # ---- scope: initiative + adopted product boards ----
+
+    def set_initiative(self, session_id: str, initiative_id: str | None) -> Session:
+        """Scopes this session to an Initiative, or clears it with None.
+
+        Changes what the session's turns are given as context (see server.py's
+        _roadmap_context_for) and where its activity is attributed when it has no project
+        of its own, so the live runtime is refreshed too - effective from the next turn.
+        The caller validates that the initiative exists (see set_project on why).
+        """
+        with self._registry_lock:
+            session = self._require(session_id)
+            session.initiative_id = initiative_id or None
+            self._refresh_scope(session)
+            self._save()
+        self._broadcast({"type": "session_updated", "session": session.to_dict()})
+        return session
+
+    def adopt_product(self, session_id: str, product: str) -> Session:
+        """Claims write authority over one more board, for a session that has worked out
+        this product is affected by its initiative. Idempotent.
+
+        This is the one path that widens what a session may write to after creation, which
+        is why it is a deliberate call and not a side effect of mentioning a product: it
+        rebuilds the PM's PATCH allowlist. A product already covered by what the session
+        owns (its pinned subtree, or a subtree it has already adopted) is accepted and
+        recorded as a no-op rather than rejected - the caller asked for a state, not a
+        change, and the state already holds.
+        """
+        if product not in PRODUCTS:
+            raise ValueError(f"Unknown product: {product}")
+        with self._registry_lock:
+            session = self._require(session_id)
+            if product in session.owned_products():
+                return session
+            session.adopted_products = [*session.adopted_products, product]
+            self._refresh_scope(session)
+            self._save()
+        self._broadcast({"type": "session_updated", "session": session.to_dict()})
+        return session
+
+    def release_product(self, session_id: str, product: str) -> Session:
+        """Drops an adopted board again - a product that turned out not to be affected
+        after all. Only ever touches `adopted_products`: the product a session was pinned
+        to at creation is not something a later scope correction gets to remove."""
+        with self._registry_lock:
+            session = self._require(session_id)
+            if product not in session.adopted_products:
+                return session
+            session.adopted_products = [p for p in session.adopted_products if p != product]
+            self._refresh_scope(session)
+            self._save()
+        self._broadcast({"type": "session_updated", "session": session.to_dict()})
+        return session
+
+    def _refresh_scope(self, session: Session) -> None:
+        """Pushes a scope change into the live PMAgent, so its system prompt and its
+        allowlist match the new ownership without a server restart. Caller holds
+        _registry_lock. No-op for a session with no runtime (archived, or worktree gone).
+
+        Deliberately not a runtime rebuild: replacing the runtime would drop the PM's
+        in-flight turn lock and its dev-task registry. Only the two derived, per-turn
+        values need to change."""
+        runtime = self.runtimes.get(session.id)
+        if runtime is not None:
+            runtime.pm_agent.set_scope(
+                initiative_id=session.initiative_id,
+                adopted_products=session.adopted_products,
+            )
+
     def set_project(self, session_id: str, project_id: str | None) -> Session:
         """Points this session's work at a Project in the work model, or clears it with
         None. Drives where the session's activity signals are attributed (see
@@ -728,6 +874,25 @@ class SessionManager:
             if runtime is not None:
                 runtime.pm_agent.set_model(model)
                 runtime.task_registry.model = model
+            self._save()
+        self._broadcast({"type": "session_updated", "session": session.to_dict()})
+        return session
+
+    # ---- mode (build vs research, live-updatable) ----
+
+    def set_mode(self, session_id: str, mode: str) -> Session:
+        """Switches a session between build and research (see Mode), effective on the
+        very next PM turn - like a scope change, this rebuilds the live PMAgent's
+        system prompt and Bash allowlist together, so what the PM is told and what it
+        can actually do never disagree. The server-side dispatch refusal reads the
+        persisted session directly, so it flips at the same moment."""
+        validate_mode(mode)
+        with self._registry_lock:
+            session = self._require(session_id)
+            session.mode = mode
+            runtime = self.runtimes.get(session_id)
+            if runtime is not None:
+                runtime.pm_agent.set_mode(mode)
             self._save()
         self._broadcast({"type": "session_updated", "session": session.to_dict()})
         return session

@@ -10,7 +10,9 @@ on top of the roadmap items that already exist:
   concept for it; a change simply gains a single `project_id`.
 - A **Project** belongs to exactly one Initiative. `initiative_id = None` is a real,
   reportable state called **unaligned** - allowed, so nobody is blocked mid-work, but
-  surfaced so it gets fixed.
+  surfaced so it gets fixed. A project may also be linked 1:1 to the epic-level ticket
+  it is tracked as in Jira/ADO (see `link_epic`); unlinked means it was created locally
+  and is pending upload to the tracker, which the sync cannot do yet.
 - An **Initiative** has many Projects and may serve **several Goals**. That is the only
   many-to-many relationship in the model.
 
@@ -26,6 +28,13 @@ Why Product is not a level: it hangs off the Change, not the tree. That is what 
 the cross-cutting flexibility for free - an initiative spans products because its
 projects' changes each carry their own product, and a product appears in many
 initiatives for the same reason. No association records needed.
+
+That is also what lets a *session* be scoped to an initiative rather than pinned to one
+product (see sessions.Session.initiative_id): the set of products an initiative touches
+is derived from its changes, so it can be discovered as the work goes instead of declared
+up front. Such a session has no project of its own at first, which is what
+`ensure_initiative_catch_all` exists for - see the note there on why its spend gets a
+real project rather than being recorded against the initiative directly.
 
 Products are persistent (they come from config). Goals, Initiatives and Projects are
 temporary: they open and close, so each carries a lifecycle status.
@@ -47,10 +56,24 @@ from typing import Callable, Literal
 
 from .config import CONFIG
 
+# Same import, same reason as roadmap.py: what makes two spellings of a ticket key the
+# SAME ticket is trackers.py's one rule, and the project⇄epic 1:1 below is only as good
+# as that definition. (trackers.py imports only config - no cycle.)
+from .trackers import normalize_key
+
 PORTFOLIO_PATH = CONFIG.workspace_dir / "portfolio.json"
 
 Lifecycle = Literal["open", "closed"]
 LIFECYCLES: tuple[Lifecycle, ...] = ("open", "closed")
+
+# Projects alone get a third, pre-delivery state. Ideation is a declared phase, not an
+# activity signal: it says "the absence of changes here is expected, not neglect", so
+# the board can stop reading an idea being researched as a dead project. Goals and
+# initiatives never carry it - an initiative is "in ideation" only derivatively, when
+# every real project under it is (see PortfolioStore.initiative_in_ideation), which is
+# what makes graduating ONE project flip the initiative without touching it.
+ProjectLifecycle = Literal["ideation", "open", "closed"]
+PROJECT_LIFECYCLES: tuple[ProjectLifecycle, ...] = ("ideation", "open", "closed")
 
 # Defaults for the catch-all scaffold. They are only defaults - every deployment names
 # its own, and the labels are the operator's, never this package's opinion about how a
@@ -62,6 +85,27 @@ DEFAULT_CATCH_ALL_PROJECT = "Unplanned work"
 
 class PortfolioError(Exception):
     """A rejected portfolio operation. The message is safe to show a user."""
+
+
+class EpicAlreadyLinked(Exception):
+    """Raised when an epic ticket is already linked to a different project.
+
+    The project⇄epic link is 1:1 in both directions, exactly like the change⇄ticket
+    link (see roadmap.TicketAlreadyLinked, whose shape this mirrors): one project holds
+    at most one ticket by construction, and this is the check that stops two projects
+    naming the same epic. Carries the conflicting project so the caller can say WHICH
+    project already owns it.
+    """
+
+    def __init__(self, tracker_id: str, ticket_key: str, project: "Project") -> None:
+        self.tracker_id = tracker_id
+        self.ticket_key = ticket_key
+        self.project = project
+        super().__init__(
+            f"{ticket_key} is already linked to the project \"{project.title}\" "
+            f"(id {project.id}). An epic can be linked to one project only - "
+            "unlink it there first."
+        )
 
 
 def _now() -> float:
@@ -128,7 +172,7 @@ class Project:
     id: str
     title: str
     description: str
-    status: Lifecycle
+    status: ProjectLifecycle
     # Exactly one initiative, or None. None is the "unaligned" state: permitted (so a
     # bug fix is never blocked on someone inventing a strategy first) but reported.
     initiative_id: str | None = None
@@ -138,10 +182,35 @@ class Project:
     # The single catch-all. Unplanned work lands here rather than floating unparented.
     # Cannot be deleted; there is at most one.
     is_catch_all: bool = False
+    # Set (to that initiative's id) on the per-initiative catch-all: where an
+    # initiative-scoped session's activity is attributed while it has no project of its
+    # own. Distinct from `is_catch_all`, and the reason it must be: the global catch-all
+    # hangs off the MAINTENANCE initiative, so reusing it for a session pinned to some
+    # other initiative would bill that initiative's spend to maintenance. Identified by
+    # this field rather than by title so renaming it can't orphan the attribution.
+    # Optional and defaulted, so portfolio.json files written before it existed load
+    # unchanged.
+    catch_all_for_initiative: str | None = None
+    # The 1:1 link to the EPIC-level ticket this project is tracked as in one configured
+    # external tracker (see trackers.py) - the project-rung counterpart of the
+    # change⇄ticket link on RoadmapItem, with the same split: only the reference lives
+    # here, and the ticket's type/title/state/URL come from the synced catalog at read
+    # time. Both None means the project exists ONLY here: created locally and pending
+    # upload to the tracker - a real, reportable state, not an error, since the upload
+    # direction of the sync is not built yet. Defaults keep pre-existing portfolio.json
+    # files loading untouched.
+    tracker_id: str | None = None
+    ticket_key: str | None = None
 
     @property
     def is_unaligned(self) -> bool:
         return self.initiative_id is None
+
+    @property
+    def is_any_catch_all(self) -> bool:
+        """True for the global catch-all and for any per-initiative one. What the delete
+        guards test: both are auto-created plumbing, neither is a project someone made."""
+        return self.is_catch_all or self.catch_all_for_initiative is not None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -220,7 +289,41 @@ class PortfolioStore:
         return [g.to_dict() for g in self._sorted(self._goals)]
 
     def list_initiatives(self) -> list[dict]:
-        return [i.to_public_dict() for i in self._sorted(self._initiatives)]
+        return [self._initiative_public(i) for i in self._sorted(self._initiatives)]
+
+    def _initiative_public(self, initiative: Initiative) -> dict:
+        """The public dict plus the derived `in_ideation` flag - every read path that
+        hands an initiative to a page or a session goes through here, so no consumer
+        can see an initiative without the flag riding along."""
+        data = initiative.to_public_dict()
+        data["in_ideation"] = self.initiative_in_ideation(initiative)
+        return data
+
+    def initiative_in_ideation(self, initiative: Initiative) -> bool:
+        """Derived, never stored: an initiative is in ideation when every project that
+        counts under it is. Deriving it is what keeps it honest - the moment one
+        project graduates to "open", the initiative reads as delivering without anyone
+        editing the initiative, and it can never drift out of sync with its projects.
+
+        Two exclusions make "every project that counts" mean what a stakeholder means:
+        catch-alls are attribution plumbing every initiative has (counting them would
+        make the state unreachable), and closed projects are history (an initiative
+        that shipped three things and is now exploring its next wave is back in
+        ideation). Vacuously true for an initiative with no real projects yet - a
+        brand-new initiative that is nothing but brainstorming so far is exactly the
+        thing this flag exists to represent. The maintenance initiative is never in
+        ideation: it is standing infrastructure, not a bet being formed.
+        """
+        if initiative.status == "closed" or initiative.is_maintenance:
+            return False
+        counted = [
+            p
+            for p in self._projects.values()
+            if p.initiative_id == initiative.id
+            and not p.is_any_catch_all
+            and p.status != "closed"
+        ]
+        return all(p.status == "ideation" for p in counted)
 
     def list_projects(self) -> list[dict]:
         return [p.to_public_dict() for p in self._sorted(self._projects)]
@@ -234,6 +337,9 @@ class PortfolioStore:
             "projects": self.list_projects(),
             "catch_all_project_id": self.catch_all_project_id,
             "unaligned": self.unaligned_report(),
+            # Which open projects have no epic link yet (see pending_upload_report).
+            # Additive; consumers on a deployment with no [[trackers]] ignore it.
+            "pending_upload": self.pending_upload_report(),
         }
 
     def get_goal(self, goal_id: str) -> Goal | None:
@@ -248,6 +354,51 @@ class PortfolioStore:
     def project_exists(self, project_id: str) -> bool:
         return project_id in self._projects
 
+    def project_for_ticket(self, tracker_id: str, ticket_key: str) -> Project | None:
+        """Which project holds this epic, if any - the read side of the 1:1 link,
+        mirroring roadmap.RoadmapStore.item_for_ticket."""
+        wanted = normalize_key(tracker_id, ticket_key)
+        return next(
+            (
+                p
+                for p in self._projects.values()
+                if p.tracker_id == tracker_id
+                and p.ticket_key
+                and normalize_key(tracker_id, p.ticket_key) == wanted
+            ),
+            None,
+        )
+
+    def linked_ticket_refs(self) -> list[tuple[str, str]]:
+        """Every (tracker_id, key) a project is linked to, for the sync to keep fresh -
+        joined with the roadmap's own refs by the caller (see server._run_tracker_sync)."""
+        return [
+            (p.tracker_id, p.ticket_key)
+            for p in self._projects.values()
+            if p.tracker_id and p.ticket_key
+        ]
+
+    def pending_upload_report(self) -> list[dict]:
+        """Open projects that exist only here: no epic link, so nothing in the tracker
+        knows about them yet. Reported, never blocked - same posture as unaligned_report:
+        this is the work statement, not an error list.
+
+        Still a report rather than an action even now that pushing exists (see
+        server.push_project_epic): whether a project deserves an epic on a shared board,
+        and when, is a product decision, so this names the candidates and a human presses
+        the button. Catch-alls are exempt: they are auto-created plumbing for cost
+        attribution, not projects anyone would file an epic for. Ideation projects are
+        exempt too, deliberately: pre-commitment ideas have nothing to file an epic
+        for yet - graduating to "open" is the moment a project earns a ticket, and
+        that is when it starts appearing here."""
+        return [
+            {"id": p.id, "title": p.title}
+            for p in self._sorted(self._projects)
+            if p.status == "open"
+            and p.tracker_id is None
+            and not p.is_any_catch_all
+        ]
+
     @property
     def catch_all_project_id(self) -> str | None:
         for project in self._projects.values():
@@ -255,15 +406,93 @@ class PortfolioStore:
                 return project.id
         return None
 
+    def catch_all_project_for_initiative(self, initiative_id: str | None) -> str | None:
+        """The per-initiative catch-all's project id, or None if there isn't one yet.
+
+        A pure read, deliberately: this is called on the hot path that records every
+        activity signal (see server.py's _session_project_id), which must never write,
+        lock for long, or broadcast. `ensure_initiative_catch_all` does the creating, once,
+        when a session is pinned to the initiative.
+        """
+        if initiative_id is None:
+            return None
+        for project in self._projects.values():
+            if project.catch_all_for_initiative == initiative_id:
+                return project.id
+        return None
+
+    def ensure_initiative_catch_all(self, initiative_id: str) -> Project:
+        """Finds or creates the project an initiative-scoped session's work is attributed
+        to while it has no project of its own. Idempotent.
+
+        Why a real project rather than attributing to the initiative directly: the additive
+        tree's exactness rests on Change -> Project -> Initiative being a unique path (see
+        this module's docstring). Recording spend one level up would leave the by-project
+        rollup with a hole that the by-initiative totals don't have. A per-initiative
+        catch-all keeps one code path, one shape, and rollups that still sum.
+        """
+        with self._lock:
+            initiative = self._initiatives.get(initiative_id)
+            if initiative is None:
+                raise PortfolioError(f"Unknown initiative: {initiative_id}")
+            for project in self._projects.values():
+                if project.catch_all_for_initiative == initiative_id:
+                    return project
+            project = Project(
+                id=_new_id(),
+                title=f"Unplanned work — {initiative.title}",
+                description=(
+                    "Auto-created. Holds work done in a session scoped to this "
+                    "initiative before it names a specific project."
+                ),
+                status="open",
+                initiative_id=initiative_id,
+                created_at=_now(),
+                updated_at=_now(),
+                catch_all_for_initiative=initiative_id,
+            )
+            self._projects[project.id] = project
+            self._save()
+        self._notify({"type": "portfolio_changed", "entity": "project", "id": project.id})
+        return project
+
+    def initiative_scope(self, initiative_id: str) -> dict | None:
+        """What an initiative-scoped session needs to know about its own initiative:
+        the initiative itself, the goals it serves, and its projects in creation order.
+
+        Returned as plain data so the caller can join it against the roadmap's changes
+        without this module learning what a change is (see roadmap.describe_initiative).
+        None for an unknown id - a session can outlive the initiative it was pinned to,
+        and every reader of this treats that as "unscoped", not as an error.
+        """
+        initiative = self._initiatives.get(initiative_id)
+        if initiative is None:
+            return None
+        return {
+            "initiative": self._initiative_public(initiative),
+            "goals": [
+                {"id": g.id, "title": g.title}
+                for g in self._sorted(self._goals)
+                if g.id in initiative.goal_ids
+            ],
+            "projects": [
+                p.to_public_dict()
+                for p in self._sorted(self._projects)
+                if p.initiative_id == initiative_id
+            ],
+        }
+
     def unaligned_report(self) -> dict:
         """Projects with no initiative, and initiatives serving no goal. Alignment is
         mandatory as a practice, so the system reports the gap rather than blocking the
         work that created it."""
         return {
+            # Ideation counts: an idea nobody has aligned to an initiative is still a
+            # reportable gap, and surfacing it early is cheaper than after graduation.
             "projects": [
                 {"id": p.id, "title": p.title}
                 for p in self._sorted(self._projects)
-                if p.is_unaligned and p.status == "open"
+                if p.is_unaligned and p.status != "closed"
             ],
             "initiatives": [
                 {"id": i.id, "title": i.title}
@@ -308,6 +537,14 @@ class PortfolioStore:
         if status not in LIFECYCLES:
             raise PortfolioError(
                 f"Unknown status: {status!r}. Must be one of: {', '.join(LIFECYCLES)}"
+            )
+        return status  # type: ignore[return-value]
+
+    def _validate_project_status(self, status: str) -> ProjectLifecycle:
+        if status not in PROJECT_LIFECYCLES:
+            raise PortfolioError(
+                f"Unknown status: {status!r}. Must be one of: "
+                + ", ".join(PROJECT_LIFECYCLES)
             )
         return status  # type: ignore[return-value]
 
@@ -462,8 +699,19 @@ class PortfolioStore:
                 raise PortfolioError(f"Unknown initiative: {initiative_id}")
             if initiative.is_maintenance:
                 raise PortfolioError("The maintenance initiative cannot be deleted.")
+            # Its own auto-created catch-all doesn't count as a reason to refuse - it was
+            # never a project anyone declared, and demanding it be moved first would make
+            # every initiative that ever hosted a scoped session undeletable. It goes with
+            # the initiative. A catch-all still holding changes is caught below, since
+            # those changes need a real home either way.
+            own_catch_all = [
+                p for p in self._projects.values()
+                if p.catch_all_for_initiative == initiative_id
+            ]
             children = [
-                p.title for p in self._projects.values() if p.initiative_id == initiative_id
+                p.title for p in self._projects.values()
+                if p.initiative_id == initiative_id
+                and p.catch_all_for_initiative != initiative_id
             ]
             if children:
                 raise PortfolioError(
@@ -471,6 +719,8 @@ class PortfolioStore:
                     + ", ".join(children)
                     + ". Move or delete them first."
                 )
+            for project in own_catch_all:
+                del self._projects[project.id]
             del self._initiatives[initiative_id]
             self._save()
         self._notify(
@@ -485,7 +735,11 @@ class PortfolioStore:
         description: str = "",
         initiative_id: str | None = None,
         is_catch_all: bool = False,
+        status: str = "open",
     ) -> Project:
+        """`status="ideation"` creates the project as a declared idea: real, visible,
+        expected to have no changes yet. Catch-alls are always open - they are
+        attribution plumbing, and plumbing is never an idea."""
         with self._lock:
             if is_catch_all and self.catch_all_project_id is not None:
                 raise PortfolioError("A catch-all project already exists.")
@@ -493,7 +747,7 @@ class PortfolioStore:
                 id=_new_id(),
                 title=self._validate_title(title),
                 description=(description or "").strip(),
-                status="open",
+                status="open" if is_catch_all else self._validate_project_status(status),
                 initiative_id=self._validate_initiative_id(initiative_id),
                 created_at=_now(),
                 updated_at=_now(),
@@ -525,17 +779,83 @@ class PortfolioStore:
             if description is not None:
                 project.description = description.strip()
             if status is not None:
-                new_status = self._validate_status(status)
+                new_status = self._validate_project_status(status)
                 if new_status == "closed" and project.is_catch_all:
                     raise PortfolioError(
                         "The catch-all project stays open - unplanned work lands there."
                     )
+                if new_status == "ideation" and project.is_any_catch_all:
+                    raise PortfolioError(
+                        "A catch-all project cannot be in ideation - it is attribution "
+                        "plumbing, not an idea."
+                    )
                 project.status = new_status
                 project.closed_at = _now() if new_status == "closed" else None
+            if (clear_initiative or initiative_id is not None) and project.is_any_catch_all:
+                raise PortfolioError(
+                    "A catch-all project cannot move between initiatives - where it "
+                    "hangs is what makes its spend attribution mean anything."
+                )
             if clear_initiative:
                 project.initiative_id = None
             elif initiative_id is not None:
                 project.initiative_id = self._validate_initiative_id(initiative_id)
+            project.updated_at = _now()
+            self._save()
+        self._notify({"type": "portfolio_changed", "entity": "project", "id": project_id})
+        return project
+
+    def link_epic(self, project_id: str, tracker_id: str, ticket_key: str) -> Project:
+        """Links a project to one epic-level ticket, 1:1.
+
+        Same contract as roadmap.RoadmapStore.link_ticket, on purpose: re-linking the
+        same pair is a no-op rather than a conflict against the project itself, a
+        DIFFERENT project already holding the ticket raises EpicAlreadyLinked, and the
+        check and the write share one lock hold so two concurrent links cannot both
+        pass. Whether the ticket actually IS an epic is the caller's check (server.py) -
+        this store deliberately knows nothing about the ticket catalog.
+
+        Catch-alls are refused: they are auto-created attribution plumbing, and pinning
+        one to a tracker epic would present unplanned-work bookkeeping as a planned
+        deliverable in the other system.
+        """
+        key = normalize_key(tracker_id, ticket_key)
+        if not tracker_id or not key:
+            raise PortfolioError(
+                "tracker_id and ticket_key are both required to link an epic"
+            )
+        with self._lock:
+            project = self._projects.get(project_id)
+            if project is None:
+                raise PortfolioError(f"Unknown project: {project_id}")
+            if project.is_any_catch_all:
+                raise PortfolioError(
+                    "A catch-all project cannot be linked to an epic - it is "
+                    "auto-created plumbing for unplanned work, not a deliverable "
+                    "the tracker should know about."
+                )
+            for other in self._projects.values():
+                if other.id == project_id or other.tracker_id != tracker_id or not other.ticket_key:
+                    continue
+                if normalize_key(tracker_id, other.ticket_key) == key:
+                    raise EpicAlreadyLinked(tracker_id, key, other)
+            project.tracker_id = tracker_id
+            project.ticket_key = key
+            project.updated_at = _now()
+            self._save()
+        self._notify({"type": "portfolio_changed", "entity": "project", "id": project_id})
+        return project
+
+    def unlink_epic(self, project_id: str) -> Project:
+        """Clears the epic link, returning the project to the local-only (pending
+        upload) state. Idempotent, like unlink_ticket: clearing a clear field is not
+        an error."""
+        with self._lock:
+            project = self._projects.get(project_id)
+            if project is None:
+                raise PortfolioError(f"Unknown project: {project_id}")
+            project.tracker_id = None
+            project.ticket_key = None
             project.updated_at = _now()
             self._save()
         self._notify({"type": "portfolio_changed", "entity": "project", "id": project_id})
@@ -551,6 +871,11 @@ class PortfolioStore:
                 raise PortfolioError(f"Unknown project: {project_id}")
             if project.is_catch_all:
                 raise PortfolioError("The catch-all project cannot be deleted.")
+            if project.catch_all_for_initiative is not None:
+                raise PortfolioError(
+                    "This is an initiative's catch-all project - it is removed with the "
+                    "initiative itself, not on its own."
+                )
             if change_count:
                 raise PortfolioError(
                     f"{change_count} change(s) still belong to this project. "
@@ -601,7 +926,7 @@ class PortfolioStore:
             ]
             groups.append(
                 {
-                    "initiative": initiative.to_public_dict(),
+                    "initiative": self._initiative_public(initiative),
                     "projects": [project_entry(p) for p in children],
                 }
             )

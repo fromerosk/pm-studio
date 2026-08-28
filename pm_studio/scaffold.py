@@ -42,11 +42,59 @@ host = "127.0.0.1"
 port = 8000
 
 # The product taxonomy for the roadmap board: id = "Display Label".
-# TOML order is display order. Delete or leave empty for a single-product repo
-# with unpinned sessions only.
+# Declaration order is display order. Delete or leave empty for a single-product
+# repo with unpinned sessions only.
+#
+# A product can be a SUB-PRODUCT of another by giving it a table with a `parent`
+# instead of a plain label. It is a full product either way - its own board, its
+# own sessions, its own id in every URL - and the parent's PM sees its roadmap at
+# full detail and can write to it. Nest as deep as your org actually is: a
+# sub-product can have sub-products of its own.
 [products]
 # web = "Web App"
-# platform = "Platform / Shared Packages"
+# platform = "Platform"
+# auth = {{ label = "Auth & Identity", parent = "web" }}
+# billing = {{ label = "Billing", parent = "web" }}
+# sso = {{ label = "SSO", parent = "auth" }}
+
+# A product can also carry METADATA - who owns it, who builds it, where it is in
+# its life, and a line of description. All optional, all context rather than
+# policy: the PM's prompt names them, the board badges a non-ga stage, nothing
+# authorizes or bills against them. `stage` is one of: discovery, development,
+# ga (the default), sunset - anything else refuses to boot.
+# [products.checkout]
+# label = "Checkout"
+# description = "Guest and member checkout, up to payment capture"
+# owner = "jane.doe"
+# team = "Payments Engineering"
+# stage = "development"
+
+# The SYSTEM taxonomy: the bounded pieces of technology your changes live in - a
+# service, an app, a module. A system is not a product. A product is the
+# business-facing thing (a line of business, or an umbrella over the technology
+# serving one); a system is code. The two are many-to-many: a product touches
+# several systems, and a system serves several products.
+#
+# Declaring this table turns on attribution: every NEW change must name the one
+# system it is contained within, which is what makes its blast radius knowable.
+# Leave it out entirely and nothing changes - no attribution, no Systems tab.
+#
+# Systems own no roadmap. Work that belongs to a system rather than a product -
+# infra, performance, upgrades - is an initiative (see the portfolio page).
+# [systems]
+# claims = "Claims Processor"
+#
+# [systems.rides]
+# label = "Rides & Logistics"
+# path = "services/rides"              # source folder, repo-root-relative
+# repo = "github.com/org/rides"        # its own repo, if it has one
+# guidance = "docs/rides/GUIDANCE.md"  # declared now, acted on later
+# pipelines = ["rides-ci"]             # declared now, acted on later
+#
+# Then say which systems each product touches. Every id must be declared above:
+# [products.checkout]
+# label = "Checkout"
+# systems = ["claims", "rides"]
 
 # Optional model allow-list override (id = "Label"); the reserved key `default`
 # names the model new sessions start on. Omit the whole table to use package
@@ -155,9 +203,16 @@ GITIGNORE_ENTRIES: tuple[str, ...] = (
     "{workspace_rel}/costing.json",
     "{workspace_rel}/audit.jsonl",
     "{workspace_rel}/activity.jsonl",
+    "{workspace_rel}/trackers.json",
+    "{workspace_rel}/people.json",
     # The stores write `<name>.tmp` then atomically replace; a snapshot landing inside
     # that window would otherwise catch one.
     "{workspace_rel}/*.tmp",
+    # Not runtime state: the env file config.toml's `token_env`/`password_env` names point
+    # at (config._load_env_file). It is the one place a deployment is told to put an actual
+    # credential, so `init` ignores it before the operator writes one there. `git add -A`
+    # honours .gitignore, which is also what keeps it out of every session snapshot.
+    ".env",
 )
 
 GITIGNORE_HEADER = "# PM Studio runtime/bookkeeping state (per-session, not product content)"
@@ -165,8 +220,11 @@ GITIGNORE_HEADER = "# PM Studio runtime/bookkeeping state (per-session, not prod
 # Appended above the credential-bearing entries so the reason is visible in the file
 # itself, where an operator tidying their .gitignore will actually read it.
 GITIGNORE_SENSITIVE_NOTE = (
-    "# Keep these ignored: accounts.json holds password hashes and live login tokens,\n"
-    "# costing.json holds pay rates, audit/activity name who did what."
+    "# Keep these ignored: .env holds the API tokens config.toml names via token_env,\n"
+    "# accounts.json holds password hashes and live login tokens,\n"
+    "# costing.json holds pay rates, audit/activity name who did what, and\n"
+    "# trackers.json caches ticket titles pulled from your Jira/ADO, and\n"
+    "# people.json holds the names and addresses of whoever those tickets are assigned to."
 )
 
 
@@ -198,7 +256,7 @@ def _ensure_gitignore(root: Path, created: list[str]) -> None:
     sensitive = {
         entry.format(workspace_rel=CONFIG.workspace_rel)
         for entry in GITIGNORE_ENTRIES
-        if any(name in entry for name in ("accounts", "costing", "audit", "activity"))
+        if any(name in entry for name in (".env", "accounts", "costing", "audit", "activity"))
     }
     lines = ["", GITIGNORE_HEADER]
     # Ordinary state first, then the credential-bearing group under its own note.
